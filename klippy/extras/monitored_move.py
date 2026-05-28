@@ -10,6 +10,157 @@ import time
 import json
 
 MAX_REASONABLE_STEP_LOSS_MM = 1.0
+Z_AXIS_BASELINE_WINDOW_SIZE = 10
+Z_AXIS_BASELINE_MIN_SAMPLES = 3
+Z_AXIS_DRIFT_WARNING_THRESHOLD_MM = 0.05
+Z_AXIS_STEP_LOSS_SUSPECT_THRESHOLD_MM = 0.10
+Z_AXIS_DRIFT_CRITICAL_THRESHOLD_MM = 0.15
+Z_AXIS_REFERENCE_MISMATCH_THRESHOLD_MM = 0.30
+Z_AXIS_MEASUREMENT_VERSION = 2
+
+
+def _coerce_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _round_mm(value):
+    if value is None:
+        return None
+    return float(f"{float(value):.6f}")
+
+
+def _mean(values):
+    if not values:
+        return None
+    return sum(values) / float(len(values))
+
+
+def _median(values):
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _trimmed_mean(values):
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) >= 5:
+        ordered = ordered[1:-1]
+    return _mean(ordered)
+
+
+def _baseline_candidate_positions(history, limit=Z_AXIS_BASELINE_WINDOW_SIZE):
+    positions = []
+    if not isinstance(history, list):
+        return positions
+    for record in reversed(history):
+        if not isinstance(record, dict):
+            continue
+        if record.get("measurement_valid") is False:
+            continue
+        alert_code = str(record.get("alert_code") or "").strip().lower()
+        measurement_type = str(record.get("measurement_type") or "").strip().lower()
+        if alert_code == "z_step_loss_suspected" or measurement_type == "z_step_loss_suspected":
+            continue
+        z_position = _coerce_float(record.get("z_position"))
+        if z_position is None:
+            continue
+        positions.append(z_position)
+        if len(positions) >= limit:
+            break
+    positions.reverse()
+    return positions
+
+
+def build_z_axis_measurement(history, timestamp, datetime_text,
+                             detected_z_pos, expected_z_max, plate_id):
+    detected_z_pos = _coerce_float(detected_z_pos)
+    expected_z_max = _coerce_float(expected_z_max)
+    baseline_values = _baseline_candidate_positions(history)
+    baseline_sample_count = len(baseline_values)
+    has_runtime_baseline = baseline_sample_count >= Z_AXIS_BASELINE_MIN_SAMPLES
+    baseline_median = _median(baseline_values) if has_runtime_baseline else None
+    baseline_mean = _mean(baseline_values) if has_runtime_baseline else None
+    baseline_trimmed_mean = _trimmed_mean(baseline_values) if has_runtime_baseline else None
+
+    delta_to_config = None
+    delta_to_runtime = None
+    if detected_z_pos is not None and expected_z_max is not None:
+        delta_to_config = detected_z_pos - expected_z_max
+    if detected_z_pos is not None and baseline_median is not None:
+        delta_to_runtime = detected_z_pos - baseline_median
+
+    measurement_type = "z_axis_baseline"
+    alert_code = None
+    alert_severity = None
+    alert_threshold = None
+    alert_reason = None
+    step_loss = _round_mm(delta_to_runtime) if delta_to_runtime is not None else None
+
+    if delta_to_runtime is not None and abs(delta_to_runtime) >= Z_AXIS_STEP_LOSS_SUSPECT_THRESHOLD_MM:
+        measurement_type = "z_step_loss_suspected"
+        alert_code = "z_step_loss_suspected"
+        alert_severity = (
+            "critical"
+            if abs(delta_to_runtime) >= Z_AXIS_DRIFT_CRITICAL_THRESHOLD_MM
+            else "high"
+        )
+        alert_threshold = Z_AXIS_STEP_LOSS_SUSPECT_THRESHOLD_MM
+        alert_reason = "z_position_changed_from_runtime_baseline"
+    elif delta_to_runtime is not None and abs(delta_to_runtime) >= Z_AXIS_DRIFT_WARNING_THRESHOLD_MM:
+        measurement_type = "z_axis_drift"
+        alert_code = "z_axis_drift_detected"
+        alert_severity = "medium"
+        alert_threshold = Z_AXIS_DRIFT_WARNING_THRESHOLD_MM
+        alert_reason = "z_position_changed_from_runtime_baseline"
+    elif delta_to_config is not None and abs(delta_to_config) >= Z_AXIS_REFERENCE_MISMATCH_THRESHOLD_MM:
+        measurement_type = "z_reference_mismatch"
+        alert_code = "z_reference_mismatch"
+        alert_severity = "medium"
+        alert_threshold = Z_AXIS_REFERENCE_MISMATCH_THRESHOLD_MM
+        alert_reason = "configured_z_max_differs_from_measured_hit_position"
+        step_loss = None
+
+    return {
+        "measurement_version": Z_AXIS_MEASUREMENT_VERSION,
+        "measurement_type": measurement_type,
+        "timestamp": timestamp,
+        "datetime": datetime_text,
+        "step_loss": step_loss,
+        "z_position": _round_mm(detected_z_pos),
+        "measured_zmax_hit": _round_mm(detected_z_pos),
+        "expected_z_max": _round_mm(expected_z_max),
+        "configured_z_max": _round_mm(expected_z_max),
+        "delta_to_config": _round_mm(delta_to_config),
+        "reference_mismatch_mm": (
+            _round_mm(delta_to_config)
+            if alert_code == "z_reference_mismatch"
+            else None
+        ),
+        "runtime_baseline_reference": "rolling_median",
+        "runtime_baseline_window_size": Z_AXIS_BASELINE_WINDOW_SIZE,
+        "runtime_baseline_min_samples": Z_AXIS_BASELINE_MIN_SAMPLES,
+        "runtime_baseline_sample_count": baseline_sample_count,
+        "runtime_baseline_median": _round_mm(baseline_median),
+        "runtime_baseline_mean": _round_mm(baseline_mean),
+        "runtime_baseline_trimmed_mean": _round_mm(baseline_trimmed_mean),
+        "runtime_baseline_values": [_round_mm(value) for value in baseline_values],
+        "delta_to_runtime_baseline": _round_mm(delta_to_runtime),
+        "alert_code": alert_code,
+        "alert_severity": alert_severity,
+        "alert_threshold_mm": _round_mm(alert_threshold),
+        "alert_reason": alert_reason,
+        "measurement_valid": detected_z_pos is not None,
+        "plate_id": plate_id
+    }
 
 class MonitoredMove:
     def __init__(self, config):
@@ -334,32 +485,10 @@ class MonitoredMove:
             expected_z_max = float(f"{z_max:.6f}")
             detected_z_pos = float(f"{final_pos[2]:.6f}")
             delta_to_config = float(f"{diferencia:.6f}")
-            measurement_type = "step_loss"
-            step_loss_value = delta_to_config
-            reference_mismatch_mm = None
-
-            if abs(delta_to_config) > MAX_REASONABLE_STEP_LOSS_MM:
-                measurement_type = "reference_mismatch"
-                step_loss_value = None
-                reference_mismatch_mm = delta_to_config
             
             # Reporte con posición absoluta y diferencia para base de datos
             gcmd.respond_info(f"Posición Z detectada: {detected_z_pos:.6f}mm")
-            
-            if measurement_type == "reference_mismatch":
-                gcmd.respond_info(
-                    f"⚠️ Desfase grande respecto a position_max ({expected_z_max:.6f}mm): "
-                    f"{delta_to_config:+.6f}mm"
-                )
-                gcmd.respond_info(
-                    "⚠️ Se registra como mismatch de referencia, no como pérdida de pasos real"
-                )
-            elif delta_to_config > 0:
-                gcmd.respond_info(f"Pérdida de pasos BAJANDO: {delta_to_config:.6f}mm")
-            elif delta_to_config < 0:
-                gcmd.respond_info(f"Pérdida de pasos SUBIENDO: {delta_to_config:.6f}mm")
-            else:
-                gcmd.respond_info(f"Pérdida de pasos: {delta_to_config:.6f}mm")
+            gcmd.respond_info(f"Diferencia contra Z-max configurado: {delta_to_config:+.6f}mm")
             
             # Escribir los valores en un archivo para nanodlp
             try:
@@ -382,40 +511,44 @@ class MonitoredMove:
                 # Archivo JSON para el historial
                 json_file = os.path.join(db_path, "step_loss_history.json")
                 
-                # Crear objeto de medición
-                measurement = {
-                    "timestamp": time.time(),
-                    "datetime": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "measurement_type": measurement_type,
-                    "step_loss": step_loss_value,
-                    "reference_mismatch_mm": reference_mismatch_mm,
-                    "expected_z_max": expected_z_max,
-                    "z_position": detected_z_pos,
-                    "delta_to_config": delta_to_config,
-                    "plate_id": plate_id
-                }
-                
                 # Leer historial existente o crear nuevo
                 history = []
                 if os.path.exists(json_file):
                     try:
-                        with open(json_file, 'r') as f:
+                        with open(json_file, 'r', encoding='utf-8') as f:
                             history = json.load(f)
                     except:
                         history = []
+
+                measurement = build_z_axis_measurement(
+                    history,
+                    time.time(),
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    detected_z_pos,
+                    expected_z_max,
+                    plate_id
+                )
                 
                 # Agregar nueva medición
                 history.append(measurement)
                 
                 # Guardar historial actualizado
-                with open(json_file, 'w') as f:
+                with open(json_file, 'w', encoding='utf-8') as f:
                     json.dump(history, f, indent=2)
                 
                 gcmd.respond_info(f"Medición guardada en: {json_file}")
+                if measurement.get("alert_code"):
+                    gcmd.respond_info(
+                        "Alerta Z: %s (delta base=%smm, delta config=%smm)" % (
+                            measurement.get("alert_code"),
+                            measurement.get("delta_to_runtime_baseline"),
+                            measurement.get("delta_to_config"),
+                        )
+                    )
                 
                 # También guardar la última medición en un archivo separado
                 latest_file = os.path.join(db_path, "step_loss_latest.json")
-                with open(latest_file, 'w') as f:
+                with open(latest_file, 'w', encoding='utf-8') as f:
                     json.dump(measurement, f, indent=2)
                     
             except Exception as e:
